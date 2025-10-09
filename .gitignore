@@ -9,3 +9,5 @@ __pycache__/
 *.pyz
 .DS_Store
 ._*
+results/
+*.mp4

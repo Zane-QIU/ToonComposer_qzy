@@ -8,6 +8,9 @@ from model.vae import WanVideoVAE
 from model.image_encoder import WanImageEncoder
 from model.prompter import WanPrompter
 from scheduler.flow_match import FlowMatchScheduler
+from util.latent_cache import LatentTrajectoryWriter, LatentTrajectoryReader
+from util.mask_utils import prepare_mask_for_denoising, load_mask_video
+from util.localized_edit import LocalizedEditor, edit_with_cache
 
 import torch, os
 from einops import rearrange, repeat
@@ -401,6 +404,7 @@ class WanVideoPipeline(BasePipeline):
         output_path=None,
         batch_idx=None,
         sequence_cond_residual_scale=1.0,
+        latent_writer: LatentTrajectoryWriter = None,
     ):
         height, width = self.check_resize_height_width(height, width)
         if num_frames % 4 != 1:
@@ -459,6 +463,27 @@ class WanVideoPipeline(BasePipeline):
         
         if sequence_cond_residual_scale != 1.0:
             extra_input.update({"sequence_cond_residual_scale": sequence_cond_residual_scale})
+        
+        # Write metadata for latent caching if enabled
+        if latent_writer is not None:
+            metadata = {
+                "timesteps": self.scheduler.timesteps.cpu().numpy().tolist(),
+                "num_steps": num_inference_steps,
+                "scheduler_type": "FlowMatchScheduler",
+                "scheduler_shift": sigma_shift,
+                "cfg_scale": cfg_scale,
+                "seed": seed,
+                "latent_shape": list(latents.shape),  # [B, C, T, H, W]
+                "height": height,
+                "width": width,
+                "num_frames": num_frames,
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "denoising_strength": denoising_strength,
+            }
+            latent_writer.write_meta(metadata)
+            # Write initial noise state z_T (at the start timestep)
+            latent_writer.write(self.scheduler.timesteps[0], latents)
 
         # Denoise
         self.load_models_to_device(["dit"])
@@ -480,6 +505,20 @@ class WanVideoPipeline(BasePipeline):
 
                 # Scheduler
                 latents = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], latents)
+                
+                # Cache the latent state z_t after the step
+                if latent_writer is not None:
+                    # Determine the next timestep (or final state at t=0)
+                    if progress_id + 1 < len(self.scheduler.timesteps):
+                        next_timestep = self.scheduler.timesteps[progress_id + 1]
+                    else:
+                        # Final denoised state (t=0 or close to it)
+                        next_timestep = 0
+                    latent_writer.write(next_timestep, latents)
+
+        # Finalize latent caching
+        if latent_writer is not None:
+            latent_writer.finalize()
 
         # Decode
         self.load_models_to_device(['vae'])
@@ -487,3 +526,231 @@ class WanVideoPipeline(BasePipeline):
         self.load_models_to_device([])
 
         return frames
+
+    @torch.no_grad()
+    def edit_from_cache(
+        self,
+        cache_dir,
+        mask_video_path=None,
+        mask_video_tensor=None,
+        prompt=None,
+        negative_prompt="",
+        input_image=None,
+        input_condition_video=None,
+        input_condition_preserved_mask=None,
+        input_condition_video_sketch=None,
+        input_condition_preserved_mask_sketch=None,
+        sketch_local_mask=None,
+        cfg_scale=None,
+        start_timestep=None,
+        feather_kernel_size=5,
+        feather_sigma=2.0,
+        feather_temporal_kernel=None,
+        feather_temporal_sigma=None,
+        tiled=True,
+        tile_size=(30, 52),
+        tile_stride=(15, 26),
+        progress_bar_cmd=tqdm,
+        sequence_cond_residual_scale=1.0,
+        latent_writer: LatentTrajectoryWriter = None,
+    ):
+        """
+        Edit a previously generated video using cached latent trajectory.
+        
+        This method enables localized re-denoising using the SAME parameters as normal generation:
+        - Use sketch, image, prompt parameters just like in __call__()
+        - The mask defines which regions to edit (white) vs preserve (black)
+        - Cached background is automatically blended with edited regions
+        
+        Args:
+            cache_dir: Directory containing cached latent trajectory
+            mask_video_path: Path to mask video/image (1=edit, 0=preserve)
+            mask_video_tensor: Alternative to mask_video_path, provide tensor directly [1, T, H, W]
+            prompt: Text prompt (if None, reuse from cache)
+            negative_prompt: Negative prompt
+            input_image: Reference image for guidance (same as __call__)
+            input_condition_video: Keyframe video for guidance (same as __call__)
+            input_condition_preserved_mask: Mask for keyframe video (same as __call__)
+            input_condition_video_sketch: Sketch video for sequence conditioning (same as __call__)
+            input_condition_preserved_mask_sketch: Mask for sketch conditioning (same as __call__)
+            sketch_local_mask: Local mask for sketch (same as __call__)
+            cfg_scale: CFG scale (if None, reuse from cache)
+            start_timestep: Timestep to start editing from (None = full denoising)
+            feather_kernel_size: Spatial feathering kernel size (0 to disable)
+            feather_sigma: Spatial feathering sigma
+            feather_temporal_kernel: Temporal feathering kernel (None = same as spatial)
+            feather_temporal_sigma: Temporal feathering sigma (None = same as spatial)
+            tiled: Whether to use tiled VAE decoding
+            tile_size: Tile size for VAE
+            tile_stride: Tile stride for VAE
+            progress_bar_cmd: Progress bar function
+            sequence_cond_residual_scale: Residual scale for sequence conditioning
+            latent_writer: Optional writer to cache this edited generation
+            
+        Returns:
+            Edited video frames
+        """
+        # Initialize editor and load cache
+        editor = LocalizedEditor(cache_dir, device=self.device, torch_dtype=self.torch_dtype)
+        metadata = editor.get_metadata()
+        
+        # Extract parameters from cache
+        height = metadata['height']
+        width = metadata['width']
+        num_frames = metadata['num_frames']
+        latent_shape = metadata['latent_shape']  # [B, C, T, H, W]
+        
+        # Use cached values if not overridden
+        if cfg_scale is None:
+            cfg_scale = metadata.get('cfg_scale', 5.0)
+        if prompt is None:
+            prompt = metadata.get('prompt', '')
+        
+        # Setup scheduler (must match cached settings)
+        num_inference_steps = metadata.get('num_steps', 50)
+        denoising_strength = metadata.get('denoising_strength', 1.0)
+        sigma_shift = metadata.get('scheduler_shift', 5.0)
+        
+        self.scheduler.set_timesteps(num_inference_steps, denoising_strength, shift=sigma_shift)
+        
+        # Load and prepare mask
+        if mask_video_tensor is not None:
+            mask_video = mask_video_tensor.to(self.device)
+        elif mask_video_path is not None:
+            mask_video = load_mask_video(
+                mask_video_path,
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                device=self.device
+            )
+        else:
+            raise ValueError("Either mask_video_path or mask_video_tensor must be provided")
+        
+        # Prepare mask for latent space
+        mask_latent = prepare_mask_for_denoising(
+            mask_video=mask_video,
+            latent_channels=latent_shape[1],
+            latent_shape=latent_shape,
+            feather_spatial=feather_kernel_size,
+            feather_sigma=feather_sigma,
+            feather_temporal=feather_temporal_kernel,
+            feather_temporal_sigma=feather_temporal_sigma
+        )
+        
+        tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
+        
+        # Encode prompt (same as __call__)
+        self.load_models_to_device(["text_encoder"])
+        prompt_emb_posi = self.encode_prompt(prompt, positive=True)
+        if cfg_scale != 1.0:
+            prompt_emb_nega = self.encode_prompt(negative_prompt, positive=False)
+        else:
+            prompt_emb_nega = None
+        
+        # Encode image guidance (same as __call__)
+        self.load_models_to_device(["image_encoder", "vae"])
+        if input_image is not None and self.image_encoder is not None:
+            image_emb = self.encode_image(input_image, num_frames, height, width)
+        elif input_condition_video is not None and self.image_encoder is not None:
+            assert input_condition_preserved_mask is not None, \
+                "`input_condition_preserved_mask` must not be None when `input_condition_video` is given."
+            image_emb = self.encode_image_or_masked_video(
+                input_condition_video, num_frames, height, width, input_condition_preserved_mask
+            )
+        else:
+            # No new guidance provided
+            image_emb = {}
+        
+        # Extra input for sequence conditioning (same as __call__)
+        extra_input = self.prepare_extra_input(
+            latents=torch.zeros(latent_shape, device=self.device)  # dummy for shape
+        )
+        
+        if self.dit.use_sequence_cond:
+            assert input_condition_video_sketch is not None, \
+                "`input_condition_video_sketch` must not be None when `use_sequence_cond` is True."
+            assert input_condition_preserved_mask_sketch is not None, \
+                "`input_condition_preserved_mask_sketch` must not be None when `input_condition_video_sketch` is given."
+            
+            if self.dit.sequence_cond_mode == "sparse":
+                sequence_cond, sequence_cond_compressed_indices = self.encode_video_with_mask_sparse(
+                    input_condition_video_sketch, height, width, 
+                    input_condition_preserved_mask_sketch, sketch_local_mask
+                )
+                extra_input.update({
+                    "sequence_cond": sequence_cond,
+                    "sequence_cond_compressed_indices": sequence_cond_compressed_indices
+                })
+            elif self.dit.sequence_cond_mode == "full":
+                sequence_cond = self.encode_video_with_mask(
+                    input_condition_video_sketch, num_frames, height, width, 
+                    input_condition_preserved_mask_sketch
+                )
+                extra_input.update({"sequence_cond": sequence_cond})
+            else:
+                raise ValueError(f"Invalid `sequence_cond_model`={self.dit.sequence_cond_mode} in the DIT model.")
+        
+        elif self.dit.use_channel_cond:
+            sequence_cond = self.encode_video_with_mask(
+                input_condition_video_sketch, num_frames, height, width, 
+                input_condition_preserved_mask_sketch
+            )
+            extra_input.update({"channel_cond": sequence_cond})
+        
+        if sequence_cond_residual_scale != 1.0:
+            extra_input.update({"sequence_cond_residual_scale": sequence_cond_residual_scale})
+        
+        self.load_models_to_device([])
+        
+        # Write metadata for latent caching if enabled
+        if latent_writer is not None:
+            edit_metadata = {
+                "timesteps": self.scheduler.timesteps.cpu().numpy().tolist(),
+                "num_steps": num_inference_steps,
+                "scheduler_type": "FlowMatchScheduler",
+                "scheduler_shift": sigma_shift,
+                "cfg_scale": cfg_scale,
+                "latent_shape": list(latent_shape),
+                "height": height,
+                "width": width,
+                "num_frames": num_frames,
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "denoising_strength": denoising_strength,
+                "edit_from_cache": cache_dir,
+                "edit_start_timestep": start_timestep,
+            }
+            latent_writer.write_meta(edit_metadata)
+        
+        # Perform localized denoising
+        self.load_models_to_device(["dit"])
+        with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self.device).type):
+            edited_latents = edit_with_cache(
+                editor=editor,
+                model=self.dit,
+                scheduler=self.scheduler,
+                new_prompt_emb=prompt_emb_posi,
+                new_image_emb=image_emb,
+                extra_input=extra_input,
+                mask_latent=mask_latent,
+                cfg_scale=cfg_scale,
+                negative_prompt_emb=prompt_emb_nega,
+                start_timestep=start_timestep,
+                progress_bar=progress_bar_cmd,
+                device=self.device,
+                latent_writer=latent_writer,
+            )
+        
+        self.load_models_to_device([])
+        
+        # Decode edited latents
+        self.load_models_to_device(['vae'])
+        edited_frames = self.decode_video(edited_latents, **tiler_kwargs)
+        self.load_models_to_device([])
+        
+        # Finalize latent caching if enabled
+        if latent_writer is not None:
+            latent_writer.finalize()
+        
+        return edited_frames
