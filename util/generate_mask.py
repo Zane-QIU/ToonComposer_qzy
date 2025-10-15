@@ -1,9 +1,9 @@
-
 import argparse
+import json
 import os
 import re
 import sys
-from typing import Set
+from typing import Set, List, Dict, Tuple
 import numpy as np
 
 try:
@@ -48,19 +48,87 @@ def parse_ranges(spec: str, total_frames: int) -> Set[int]:
     return result
 
 
+def parse_mask_regions(regions_json: str) -> List[Dict]:
+    """
+    Parse mask regions from JSON string or file.
+    
+    Expected format:
+    [
+        {
+            "type": "rect",  # or "polygon"
+            "coords": [x, y, w, h],  # for rect: [x, y, width, height]
+                                      # for polygon: [[x1,y1], [x2,y2], ...]
+            "frames": "0-10, 15-20",  # frame range string
+            "color": "white"  # "white" or "black", default "white"
+        },
+        ...
+    ]
+    """
+    if not regions_json:
+        return []
+    
+    # Check if it's a file path
+    if os.path.isfile(regions_json):
+        with open(regions_json, 'r') as f:
+            data = json.load(f)
+    else:
+        data = json.loads(regions_json)
+    
+    if not isinstance(data, list):
+        raise ValueError("Mask regions must be a JSON array")
+    
+    return data
+
+
+def apply_mask_region(frame: np.ndarray, region: Dict, color_value: int = 255):
+    """
+    Apply a mask region to a frame.
+    
+    Args:
+        frame: The frame to modify (will be modified in-place)
+        region: Region specification dict
+        color_value: 255 for white, 0 for black
+    """
+    region_type = region.get("type", "rect").lower()
+    coords = region.get("coords")
+    
+    if region_type == "rect":
+        # coords: [x, y, width, height]
+        if len(coords) != 4:
+            raise ValueError(f"Rectangle coords must have 4 values: {coords}")
+        x, y, w, h = coords
+        frame[y:y+h, x:x+w] = color_value
+        
+    elif region_type == "polygon":
+        # coords: [[x1,y1], [x2,y2], ...]
+        pts = np.array(coords, dtype=np.int32)
+        cv2.fillPoly(frame, [pts], color=(color_value, color_value, color_value))
+        
+    else:
+        raise ValueError(f"Unknown region type: {region_type}")
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate a video with specified resolution, fps, frame count, and frame ranges "
-                    "that are pure white or pure black. Ranges are inclusive and 0-based."
+        description="Generate a video mask with spatial-temporal regions. "
+                    "Supports both full-frame ranges and specific spatial regions across time."
     )
     parser.add_argument("--width", "-W", type=int, required=True, help="Frame width in pixels.")
     parser.add_argument("--height", "-H", type=int, required=True, help="Frame height in pixels.")
     parser.add_argument("--fps", "-r", type=float, required=True, help="Frames per second.")
     parser.add_argument("--frames", "-n", type=int, required=True, help="Total number of frames.")
-    parser.add_argument("--white", type=str, default="", help='White frame ranges, e.g. "0-10, 50-60".')
-    parser.add_argument("--black", type=str, default="", help='Black frame ranges, e.g. "11-20, 70-80".')
+    
+    # Legacy full-frame options (kept for backward compatibility)
+    parser.add_argument("--white", type=str, default="", help='Full-frame white ranges, e.g. "0-10, 50-60".')
+    parser.add_argument("--black", type=str, default="", help='Full-frame black ranges, e.g. "11-20, 70-80".')
+    
+    # New spatial-temporal region options
+    parser.add_argument("--regions", type=str, default="", 
+                        help='JSON string or file path defining mask regions. '
+                             'Format: [{"type":"rect","coords":[x,y,w,h],"frames":"0-10","color":"white"},...]')
+    
     parser.add_argument("--default", choices=["black", "white"], default="black",
-                        help="Color for unspecified frames.")
+                        help="Color for unspecified frames/regions.")
     parser.add_argument("--codec", type=str, default="mp4v",
                         help="FourCC codec (e.g., mp4v, XVID, MJPG). Default: mp4v")
     parser.add_argument("--output", "-o", type=str, default="output.mp4", help="Output video file path.")
@@ -84,7 +152,7 @@ def main():
         print(f"Output file exists: {out_path}. Use --overwrite to replace.")
         sys.exit(3)
 
-    # Parse ranges
+    # Parse legacy full-frame ranges
     try:
         white_set = parse_ranges(args.white, args.frames)
         black_set = parse_ranges(args.black, args.frames)
@@ -92,24 +160,46 @@ def main():
         print(f"Invalid range specification: {e}")
         sys.exit(4)
 
-    # Compute precedence: white overrides black
+    # Parse spatial-temporal regions
+    try:
+        mask_regions = parse_mask_regions(args.regions)
+    except (ValueError, json.JSONDecodeError) as e:
+        print(f"Invalid mask regions: {e}")
+        sys.exit(4)
+
+    # Process mask regions: organize by frame
+    frame_regions: Dict[int, List[Dict]] = {}
+    for region in mask_regions:
+        frames_str = region.get("frames", "")
+        region_frames = parse_ranges(frames_str, args.frames)
+        color = region.get("color", "white").lower()
+        
+        for frame_idx in region_frames:
+            if frame_idx not in frame_regions:
+                frame_regions[frame_idx] = []
+            frame_regions[frame_idx].append({
+                "type": region.get("type", "rect"),
+                "coords": region.get("coords"),
+                "color": color
+            })
+
+    # Compute precedence for legacy options: white overrides black
     conflict = white_set & black_set
     if conflict:
-        # Remove conflicts from black so that white wins
         black_set -= conflict
 
     # Summary
     print(f"Generating video: {out_path}")
     print(f"Resolution: {args.width}x{args.height} @ {args.fps} fps, frames: {args.frames}")
-    print(f"White frames: {len(white_set)}; Black frames: {len(black_set)}; Default: {args.default}")
+    print(f"Legacy - White frames: {len(white_set)}; Black frames: {len(black_set)}")
+    print(f"Spatial regions: {len(mask_regions)} regions defined")
+    print(f"Default: {args.default}")
     if conflict:
         print(f"Note: {len(conflict)} overlapping frames resolved in favor of white.")
 
     # Prepare frames
     h, w = args.height, args.width
-    white_frame = np.full((h, w, 3), 255, dtype=np.uint8)
-    black_frame = np.zeros((h, w, 3), dtype=np.uint8)
-    default_frame = white_frame if args.default == "white" else black_frame
+    default_value = 255 if args.default == "white" else 0
 
     # Video writer
     fourcc = cv2.VideoWriter_fourcc(*args.codec)
@@ -120,13 +210,31 @@ def main():
 
     try:
         for i in range(args.frames):
+            # Start with default color
+            frame = np.full((h, w, 3), default_value, dtype=np.uint8)
+            
+            # Apply legacy full-frame settings
             if i in white_set:
-                frame = white_frame
+                frame[:] = 255
             elif i in black_set:
-                frame = black_frame
-            else:
-                frame = default_frame
+                frame[:] = 0
+            
+            # Apply spatial regions (these override legacy settings)
+            if i in frame_regions:
+                for region in frame_regions[i]:
+                    color_val = 255 if region["color"] == "white" else 0
+                    try:
+                        apply_mask_region(frame, region, color_val)
+                    except Exception as e:
+                        print(f"Warning: Failed to apply region at frame {i}: {e}")
+            
             writer.write(frame)
+            
+            # Progress indicator
+            if (i + 1) % 30 == 0 or i == args.frames - 1:
+                print(f"Progress: {i + 1}/{args.frames} frames", end='\r')
+        
+        print()  # New line after progress
     finally:
         writer.release()
 
